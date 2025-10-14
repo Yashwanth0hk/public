@@ -1,0 +1,49 @@
+Gateway Application Properties
+
+server.port=8443
+server.ssl.enabled=true
+server.ssl.key-store=file:/C:/tls/gateway.p12
+server.ssl.key-store-password=changeit
+server.ssl.key-store-type=PKCS12
+server.ssl.client-auth=need
+server.ssl.trust-store=file:/C:/tls/truststore.p12
+server.ssl.trust-store-password=changeit
+server.ssl.trust-store-type=PKCS12
+
+# Outbound mTLS to Security Service (updated keys)
+spring.cloud.gateway.server.webflux.httpclient.ssl.key-store=file:/C:/tls/gateway.p12
+spring.cloud.gateway.server.webflux.httpclient.ssl.key-store-password=changeit
+spring.cloud.gateway.server.webflux.httpclient.ssl.key-store-type=PKCS12
+spring.cloud.gateway.httpclient.ssl.trusted-x509-certificates[0]=file:/C:/tls/ca.crt
+
+# ✅ Updated route configuration (new property names)
+spring.cloud.gateway.server.webflux.routes[0].id=security
+spring.cloud.gateway.server.webflux.routes[0].uri=https://security.svc.local:8443
+spring.cloud.gateway.server.webflux.routes[0].predicates[0]=Path=/auth/**
+
+# Eureka client
+eureka.client.serviceUrl.defaultZone=https://eureka.svc.local:8761/eureka/
+eureka.instance.hostname=gateway.svc.local
+eureka.instance.secure-port-enabled=true
+eureka.instance.non-secure-port-enabled=false
+
+management.endpoints.web.exposure.include=health,info
+
+
+Run with command
+java -Djavax.net.ssl.trustStore=C:\tls\truststore.p12 -Djavax.net.ssl.trustStoreType=PKCS12  -Djavax.net.ssl.trustStorePassword=changeit -jar  ApiGateway-0.0.1-SNAPSHOT.jar
+
+
+
+-************************If it doesnt work then run the below command---------------------------------------------
+# copy ca.crt to C:\tls if not already there, then:
+Import-Certificate -FilePath C:\tls\ca.crt -CertStoreLocation Cert:\LocalMachine\Root
+
+# list matching certs in LocalMachine root
+Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Subject -like "*Lab Internal Root CA*" } | Format-List Subject,Thumbprint,NotAfter
+
+C:\Windows\System32\curl.exe https://eureka.svc.local:8761/ -v
+
+C:\Windows\System32\curl.exe https://eureka.svc.local:8761/ --cacert C:\tls\ca.crt -v --ssl-no-revoke
+
+
