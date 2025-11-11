@@ -1,0 +1,137 @@
+# =============================================
+# 🌐 GLOBAL SETTINGS
+# =============================================
+user  nginx;
+worker_processes  auto;
+
+# Log and PID configuration
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+# =============================================
+# ⚙️ HTTP BLOCK CONFIGURATIONS
+# =============================================
+http {
+
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # ---------------------------
+    # 🛡️ Hide Nginx version details (Fix: Server info exposed)
+    # ---------------------------
+    server_tokens off;
+
+    # ---------------------------
+    # 🧩 Gzip Compression (optional, safe if configured correctly)
+    # ---------------------------
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+    # ---------------------------
+    # 🚧 IP RATE LIMITING (DDOS / BRUTE FORCE Protection)
+    # ---------------------------
+    # Define zone memory to store client IPs
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=login_limit:10m rate=3r/s;
+
+    # This helps to limit repeated requests from the same IP.
+    # 10r/s = 10 requests per second (for API routes)
+    # 3r/s = 3 requests per second (for login endpoints)
+
+    # =============================================
+    # 🌍 SERVER BLOCK
+    # =============================================
+    server {
+        listen 80;
+        server_name yourdomain.com;  # Change to your domain or IP
+
+        # ---------------------------
+        # 🚫 Security Headers
+        # ---------------------------
+
+        # 1️⃣ CORS POLICY — restrict allowed origins
+        # (Modify allow-origin value to your trusted frontend domain)
+        add_header Access-Control-Allow-Origin "https://frontend.yourdomain.com" always;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Authorization, Content-Type, X-Requested-With" always;
+        add_header Access-Control-Allow-Credentials "true" always;
+
+        # OPTIONS preflight handler
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Max-Age 3600;
+            add_header Content-Length 0;
+            add_header Content-Type text/plain;
+            return 204;
+        }
+
+        # 2️⃣ CSP HEADER (Fix: Missing Content Security Policy)
+        # Allows resources only from self and trusted CDNs.
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' https://trusted.cdn.com; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;" always;
+
+        # 3️⃣ Clickjacking Protection (Fix: App vulnerable to clickjacking)
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        # OR using CSP frame-ancestors for modern browsers
+        add_header Content-Security-Policy "frame-ancestors 'self';" always;
+
+        # 4️⃣ XSS Protection (Optional, modern browsers handle this automatically)
+        add_header X-XSS-Protection "1; mode=block" always;
+
+        # 5️⃣ Prevent MIME sniffing
+        add_header X-Content-Type-Options "nosniff" always;
+
+        # ---------------------------
+        # 🧭 Rate Limiting for APIs
+        # ---------------------------
+        location /api/ {
+            limit_req zone=api_limit burst=20 nodelay;
+            proxy_pass http://127.0.0.1:8080;  # Backend service
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # ---------------------------
+        # 🧭 Rate Limiting for Login Endpoint
+        # ---------------------------
+        location /auth/login {
+            limit_req zone=login_limit burst=5 nodelay;
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # ---------------------------
+        # 🧩 Static Resources (optional)
+        # ---------------------------
+        location /static/ {
+            root /var/www/html;
+        }
+
+        # ---------------------------
+        # ⚙️ Default Proxy Setup for Spring Boot Backend
+        # ---------------------------
+        location / {
+            proxy_pass http://127.0.0.1:8080;  # Backend Spring Boot
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # ---------------------------
+        # 🧹 Custom Error Pages
+        # ---------------------------
+        error_page 403 /403.html;
+        error_page 404 /404.html;
+        error_page 500 502 503 504 /50x.html;
+
+        location = /50x.html {
+            root /usr/share/nginx/html;
+        }
+    }
+}
