@@ -1,0 +1,117 @@
+CREATE TABLE IF NOT EXISTS test.refresh_token (
+    id BIGSERIAL PRIMARY KEY,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    sub VARCHAR(255) NOT NULL,               -- JWT subject (user id/contact)
+    active CHAR(1) NOT NULL CHECK (active IN ('Y','N')),
+    expiry_epoch BIGINT NOT NULL,            -- JWT exp claim (seconds since 1970)
+    expiry_date TIMESTAMP WITH TIME ZONE NOT NULL,
+    user_id BIGINT REFERENCES test.users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+@Entity
+@Table(name = "refresh_token")
+public class RefreshToken {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String token;
+
+    @Column(nullable = false)
+    private String sub;
+
+    @Column(nullable = false)
+    private Character active; // 'Y' or 'N'
+
+    @Column(name = "expiry_epoch", nullable = false)
+    private Long expiryEpochSeconds;
+
+    @Column(name = "expiry_date", nullable = false)
+    private LocalDateTime expiryDate;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id")
+    private User user;
+
+    @Column(name = "created_at")
+    private LocalDateTime createdAt = LocalDateTime.now();
+}
+
+
+public String generateToken(String contact, Set<String> privileges) {
+    Date issuedAt = new Date(System.currentTimeMillis());
+    Date expiry = new Date(System.currentTimeMillis() + accessExpiration);
+
+    String token = Jwts.builder()
+            .subject(contact)
+            .claim("Privileges", privileges)
+            .issuedAt(issuedAt)
+            .expiration(expiry)
+            .signWith(keyProvider.getPrivateKey(), alg)
+            .compact();
+
+    long expEpoch = expiry.toInstant().getEpochSecond();
+    LocalDateTime expLocal = LocalDateTime.ofInstant(expiry.toInstant(), ZoneOffset.UTC);
+
+    RefreshToken entity = new RefreshToken();
+    entity.setToken(token);
+    entity.setSub(contact);
+    entity.setActive('Y');
+    entity.setExpiryEpochSeconds(expEpoch);
+    entity.setExpiryDate(expLocal);
+    entity.setUser(userService.findByContact(contact)); // optional
+    refreshTokenRepository.save(entity);
+
+    return token;
+}
+
+@Component
+@Order(2) // runs after JwtVerificationFilter
+public class SessionValidationFilter implements GatewayFilter {
+
+    @Autowired private WebClient.Builder webClientBuilder;
+
+    private static final String AUTH_SERVICE_URL = "http://auth-service/api/internal/token/validate";
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        Claims claims = (Claims) exchange.getAttribute("jwtClaims");
+        String token = (String) exchange.getAttribute("token");
+
+        if (claims == null || token == null)
+            return onError(exchange, "Missing JWT data", HttpStatus.UNAUTHORIZED);
+
+        String sub = claims.getSubject();
+
+        return webClientBuilder.build()
+                .get()
+                .uri(AUTH_SERVICE_URL + "?sub=" + sub)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .retrieve()
+                .bodyToMono(Boolean.class)
+                .flatMap(isActive -> {
+                    if (!isActive)
+                        return onError(exchange, "Session invalid or user logged out", HttpStatus.UNAUTHORIZED);
+                    return chain.filter(exchange);
+                })
+                .onErrorResume(ex -> onError(exchange, ex.getMessage(), HttpStatus.UNAUTHORIZED));
+    }
+
+    private Mono<Void> onError(ServerWebExchange exchange, String err, HttpStatus status) {
+        exchange.getResponse().setStatusCode(status);
+        byte[] bytes = err.getBytes(StandardCharsets.UTF_8);
+        DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
+        return exchange.getResponse().writeWith(Mono.just(buffer));
+    }
+}
+
+@Repository
+public interface RefreshTokenRepository extends JpaRepository<RefreshToken, Long> {
+
+    boolean existsBySubAndActiveAndExpiryDateAfter(String sub, Character active, LocalDateTime now);
+
+    @Modifying
+    @Query("UPDATE RefreshToken r SET r.active = 'N' WHERE r.sub = :sub AND r.active = 'Y'")
+    void deactivateTokensBySub(@Param("sub") String sub);
+}
