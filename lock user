@@ -1,0 +1,90 @@
+@Entity
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String contact;
+    private String password;
+
+    private int failedAttempt; // failed login counter
+    private boolean accountNonLocked = true; // if false, account is locked
+    private LocalDateTime lockTime; // time when account was locked
+
+    // Other fields like roles, active, etc.
+
+    // getters and setters
+}
+
+
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.QueryHint;
+import org.springframework.data.jpa.repository.Lock;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "5000"))
+@Query("SELECT u FROM User u WHERE u.contact = :mobile")
+Optional<User> lockUser(@Param("mobile") String mobile);
+
+}
+
+
+@Service
+public class AuthService {
+
+    private static final int MAX_FAILED_ATTEMPTS = 3;
+    private static final long LOCK_DURATION_MINUTES = 60;
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    @Transactional
+    public void login(String mobile, String rawPassword) {
+
+        User user = userRepository.lockUser(mobile)
+            .orElseThrow(() -> new CustomException("User not found", HttpStatus.NOT_FOUND));
+
+        // Check if account is locked and unlock if 60 minutes passed
+        if (!user.isAccountNonLocked()) {
+            if (user.getLockTime().plusMinutes(LOCK_DURATION_MINUTES).isBefore(LocalDateTime.now())) {
+                // Unlock account after lock duration
+                user.setAccountNonLocked(true);
+                user.setFailedAttempt(0);
+                user.setLockTime(null);
+            } else {
+                throw new CustomException(
+                    "Account is locked. Try again later.",
+                    HttpStatus.LOCKED
+                );
+            }
+        }
+
+        // Verify password
+        if (!passwordEncoder.matches(rawPassword, user.getPassword())) {
+            // Increment failed attempts
+            int failedAttempts = user.getFailedAttempt() + 1;
+            user.setFailedAttempt(failedAttempts);
+
+            // Lock if max attempts reached
+            if (failedAttempts >= MAX_FAILED_ATTEMPTS) {
+                user.setAccountNonLocked(false);
+                user.setLockTime(LocalDateTime.now());
+            }
+
+            userRepository.save(user);
+            throw new CustomException("Invalid password", HttpStatus.UNAUTHORIZED);
+        }
+
+        // Successful login
+        user.setFailedAttempt(0); // reset counter
+        userRepository.save(user);
+
+        // Generate JWT / refresh tokens or your login logic
+    }
+}
