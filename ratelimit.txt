@@ -1,0 +1,465 @@
+--------------------Niginx-------------------------------------------------
+
+#user  nobody;
+worker_processes  1;
+
+#error_log  logs/error.log;
+#error_log  logs/error.log  notice;
+#error_log  logs/error.log  info;
+
+#pid        logs/nginx.pid;
+
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    # 1. Define rate limit zones per API
+    # $binary_remote_addr is the client IP
+    limit_req_zone $binary_remote_addr zone=auth_zone:10m rate=10r/m;      # 10 req/min
+    limit_req_zone $binary_remote_addr zone=public_auth_zone:10m rate=5r/m; # 5 req/min
+
+    server {
+        listen 80;
+        server_name localhost;
+		
+		location / {
+            root   html;
+            index  index.html index.htm;
+        }
+
+        location /api/auth {
+            limit_req zone=auth_zone burst=5 nodelay;
+            limit_req_status 429;
+			include proxy_common.conf;
+
+        }
+
+        location /api/public/auth {
+            limit_req zone=public_auth_zone burst=2 nodelay;
+            limit_req_status 429;
+			include proxy_common.conf;
+        }       
+
+    
+    }
+}
+------------------------------proxy_common.conf----------------------------------------------
+proxy_pass http://localhost:8010;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+
+--------------------------------------------------------------------------------------------
+
+public Map<String, Bucket> getAllBuckets() {
+    return bucketCache.asMap();
+}
+
+package com.bel.security.controller;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.bel.security.utils.BucketCacheService;
+
+import io.github.bucket4j.Bucket;
+
+@RestController
+public class RateLimitController {
+
+    @Autowired
+    private BucketCacheService bucketCacheService;
+
+    @GetMapping("/admin/buckets")
+    public List<BucketData> getAllBuckets() {
+
+        Map<String, Bucket> buckets = bucketCacheService.getAllBuckets();
+
+        return buckets.entrySet()
+                .stream()
+                .map(entry -> new BucketData(
+                        entry.getKey(),
+                        getEndpoint(entry.getKey()),
+                        entry.getValue().getAvailableTokens()
+                ))
+                .collect(Collectors.toList());
+    }
+
+    private String getEndpoint(String key) {
+        if (key.contains(":")) {
+            return key.split(":")[1];
+        }
+        return "unknown";
+    }
+
+    public static class BucketData {
+
+        private String key;
+        private String endpoint;
+        private long availableTokens;
+
+        public BucketData(String key, String endpoint, long availableTokens) {
+            this.key = key;
+            this.endpoint = endpoint;
+            this.availableTokens = availableTokens;
+        }
+
+        public String getKey() {
+            return key;
+        }
+
+        public String getEndpoint() {
+            return endpoint;
+        }
+
+        public long getAvailableTokens() {
+            return availableTokens;
+        }
+    }
+}
+
+--------------------------------------BucketCacheService---------------------------------------------------------------------
+
+package com.bel.security.utils;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.Bucket;
+
+@Component
+//Service that manages all rate-limiting buckets
+public class BucketCacheService {
+
+
+	    /**
+	     * Map defining rate limits per endpoint.
+	     * Key: endpoint name (e.g., "auth", "public_auth")
+	     * Value: Bandwidth object from Bucket4j defining:
+	     *   - capacity: maximum number of requests allowed
+	     *   - refillIntervally: how many tokens are added back per interval
+	     */
+	    private final Map<String, Bandwidth> endpointLimits = Map.of(
+	        "public_auth",
+	            Bandwidth.builder()
+	                .capacity(5)                        // maximum 5 requests
+	                .refillIntervally(5, Duration.ofMinutes(1)) // refill 5 tokens every 1 minute
+	                .build(),
+	        "auth",
+	            Bandwidth.builder()
+	                .capacity(10)                       // maximum 10 requests
+	                .refillIntervally(10, Duration.ofMinutes(1)) // refill 10 tokens every 1 minute
+	                .build()
+	    );
+
+	    // Optional: you could have used a simple ConcurrentHashMap to store buckets, but
+	    // we are using a more advanced cache (Caffeine) below.
+	    // private final ConcurrentHashMap<String, Bucket> bucketMap = new ConcurrentHashMap<>();
+
+	    /**
+	     * Caffeine cache storing all buckets.
+	     * Key: a combination of IP + endpoint (e.g., "192.168.0.1:auth")
+	     * Value: Bucket4j Bucket object that tracks token consumption
+	     * Features:
+	     *   - maximumSize(10_000): cache will not store more than 10k buckets
+	     *   - expireAfterAccess(Duration.ofMinutes(10)): removes buckets that haven't
+	     *     been used in the last 10 minutes
+	     */
+	    private final Cache<String, Bucket> bucketCache = Caffeine.newBuilder()
+	        .maximumSize(10_000)
+	        .expireAfterAccess(Duration.ofMinutes(10))
+	        .build();
+
+	    /**
+	     * Get or create a bucket for a specific key and endpoint.
+	     * 
+	     * @param key      unique key (e.g., IP address)
+	     * @param endpoint endpoint name (e.g., "auth", "public_auth")
+	     * @return Bucket4j Bucket object
+	     *
+	     * Logic:
+	     *   - If a bucket already exists in the cache, return it.
+	     *   - If not, create a new bucket with the rate limits of the endpoint and
+	     *     store it in the cache.
+	     */
+	    public Bucket getBucket(String key, String endpoint) {
+	        return bucketCache.get(key, k -> createBucket(endpoint));
+	    }
+
+	    /**
+	     * Returns all buckets currently stored in the cache.
+	     * Useful for monitoring or exposing via an API.
+	     *
+	     * @return map of all buckets
+	     */
+	    public Map<String, Bucket> getAllBuckets() {
+	        return bucketCache.asMap();
+	    }
+
+	    /**
+	     * Create a new bucket for a given endpoint using its rate limit.
+	     * 
+	     * @param endpoint endpoint name
+	     * @return new Bucket4j Bucket
+	     *
+	     * Logic:
+	     *   - Look up the endpointLimits map to get the rate limit.
+	     *   - If the endpoint is not configured, use a default limit of 20 requests
+	     *     per minute.
+	     *   - Build and return the Bucket object.
+	     */
+	    private Bucket createBucket(String endpoint) {
+	        Bandwidth limit = endpointLimits.getOrDefault(
+	            endpoint,
+	            Bandwidth.builder()
+	                .capacity(20)                    // default 20 requests
+	                .refillIntervally(20, Duration.ofMinutes(1)) // default refill
+	                .build()
+	        );
+	        return Bucket.builder().addLimit(limit).build();
+	    }
+
+	    /**
+	     * Scheduled task to clear all buckets from the cache every 20 minutes.
+	     * 
+	     * This is optional. It ensures that old buckets that might not be used
+	     * anymore are cleared, freeing memory.
+	     */
+	    @Scheduled(fixedRate = 20 * 60 * 1000) // runs every 20 minutes
+	    public void clearAllBuckets() {
+	        bucketCache.invalidateAll(); // remove all buckets
+	        System.out.println("All buckets cleared at " + java.time.LocalDateTime.now());
+	    }
+}
+
+
+
+----------------------------------------------GatewaySignatureFilter-------------------------------------------------------
+
+package com.bel.security.utils;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.Bucket;
+import io.github.bucket4j.ConsumptionProbe;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+@Component
+public class GatewaySignatureFilter extends OncePerRequestFilter {
+
+	@Autowired
+	private HmacVerifier HmacVerifier;
+
+	@Autowired
+	private BucketCacheService bucketCacheService;
+
+	private static final Logger logger = LoggerFactory.getLogger(GatewaySignatureFilter.class);
+
+	@Override
+	protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+			throws ServletException, IOException {
+		try {
+
+			// Only validate for secured (authenticated) endpoints
+			String path = request.getRequestURI();
+			logger.info("Request URL: {}", path);
+
+			// Skip public endpoints
+
+			logRequestHeaders(request);
+
+			String ip = getClientIP(request); // get real client IP
+			String bucketKey = getBucketKey(path); // determine endpoint type
+			String cacheKey = ip + ":" + bucketKey; // unique key per IP + endpoint
+
+//			Bucket bucket = bucketCache.computeIfAbsent(ip + ":" + bucketKey, k -> createBucket(bucketKey));
+
+			// --- RATE LIMITER LOGIC ---
+			// Get or create bucket from the service
+//	        Bucket bucket = bucketCacheService.getBucket(cacheKey, bucketKey);
+//
+//	        // Try to consume 1 token from the bucket
+//	        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+//
+//	        // If no tokens left, respond with 429 Too Many Requests
+//	        if (!probe.isConsumed()) {
+//	            long waitSeconds = probe.getNanosToWaitForRefill() / 1_000_000_000;
+//	            response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+//	            response.setHeader("Retry-After", String.valueOf(waitSeconds));
+//	            response.setContentType("text/plain");
+//	            response.getWriter().write("Too many requests. Retry after " + waitSeconds + " seconds.");
+//	            return;
+//	        }
+			// --- END RATE LIMITER LOGIC ---
+
+			if (isPublicApi(path)) {
+				filterChain.doFilter(request, response);
+				return;
+			}
+//			ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+//
+//			if (!probe.isConsumed()) {
+//				response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+//				response.getWriter().write("Too many requests");
+//				return;
+//			}
+			String userId = request.getHeader("X-User-Subject");
+			String role = request.getHeader("X-User-Role");
+
+			String timestamp = request.getHeader("X-Timestamp");
+			String signature = request.getHeader("X-Gateway-Signature");
+			logger.info("Header part: {}", userId);
+			if (userId == null || role == null || timestamp == null || signature == null) {
+				response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Missing signature headers");
+				return;
+			}
+
+			// Check timestamp freshness (e.g., must be within 5 minutes)
+//			long ts = Long.parseLong(timestamp);
+//			long now = Instant.now().getEpochSecond();
+//			if (Math.abs(now - ts) > 300) { // 5 minutes
+//				response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Timestamp expired");
+//				return;
+//			}
+			String data = userId + role + timestamp;
+			try {
+				boolean isvalidaSignature = HmacVerifier.isValid(data, signature);
+				if (!isvalidaSignature) {
+					response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "invalid signature");
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+				// TODO: handle exception
+			}
+			// Optional: create authorities from the role
+			List<GrantedAuthority> authorities = Collections.emptyList();
+			if (role != null && !role.isEmpty()) {
+				authorities = Arrays.stream(role.split(",")).map(String::trim).map(SimpleGrantedAuthority::new)
+						.collect(Collectors.toList());
+			}
+
+			// Create an authentication token
+			Authentication auth = new UsernamePasswordAuthenticationToken(userId, null, authorities);
+
+			// Set it in the security context
+			SecurityContextHolder.getContext().setAuthentication(auth);
+			logger.info("last line: {}", "hi");
+			filterChain.doFilter(request, response);
+		} catch (Exception e) {
+			// TODO: handle exception
+			e.printStackTrace();
+		}
+	}
+
+	private String getBucketKey(String path) {
+		if (path.startsWith("/public/auth"))
+			return "public_auth";
+		if (path.startsWith("/auth"))
+			return "auth";
+		return "default";
+	}
+
+	private boolean isPublicApi(String path) {
+		System.out.println("path in ispublic =" + path);
+		return path.startsWith("/public") || path.contains("/auth") || path.contains("/swagger-ui.html")
+				|| path.contains("/swagger-ui") || path.contains("/v3/api-docs") || path.contains("/actuator")
+				|| path.contains("/favicon.ico");
+	}
+
+	/** Log all request headers */
+	private void logRequestHeaders(HttpServletRequest request) {
+		Enumeration<String> headerNames = request.getHeaderNames();
+		if (headerNames != null) {
+			while (headerNames.hasMoreElements()) {
+				String name = headerNames.nextElement();
+				logger.info("Header {} = {}", name, request.getHeader(name));
+			}
+		}
+	}
+
+	/** Get the real client IP, considering X-Forwarded-For */
+	private String getClientIP(HttpServletRequest request) {
+		String xfHeader = request.getHeader("X-Forwarded-For");
+		if (xfHeader == null)
+			return request.getRemoteAddr();
+		return xfHeader.split(",")[0];
+	}
+
+}
+---------------------------------------------------dependency---------------------------------------------------------------------------
+
+<dependency>
+			<groupId>com.bucket4j</groupId>
+			<artifactId>bucket4j-core</artifactId>
+			<version>8.10.1</version>
+		</dependency>
+		
+---------------------------------------------------------------------------------------------------------
+
+// Retrieve the bucket for this IP:endpoint combination
+        // If it doesn't exist, a new bucket will be created with the endpoint's rate limits
+        Bucket bucket = bucketCacheService.getBucket(cacheKey, bucketKey);
+
+        // Attempt to consume 1 token from the bucket
+        // Returns a ConsumptionProbe with details about token consumption
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+
+        // Check if the token was successfully consumed
+        if (!probe.isConsumed()) {
+            // Token not available: user has exceeded their limit
+            // Calculate how long they need to wait until next token is refilled
+            long waitSeconds = probe.getNanosToWaitForRefill() / 1_000_000_000;
+
+            // Respond with HTTP 429 Too Many Requests
+            response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+            response.setHeader("Retry-After", String.valueOf(waitSeconds)); // Tells client how long to wait
+            response.setContentType("text/plain");
+            response.getWriter().write(
+                    "Too many requests. Retry after " + waitSeconds + " seconds."
+            );
+
+            // Stop further processing of this request
+            return;
+        }
