@@ -462,4 +462,92 @@ public class GatewaySignatureFilter extends OncePerRequestFilter {
 
             // Stop further processing of this request
             return;
+
         }
+
+-------------------------------------------------------------------------------------------------------------------------------------
+# =============================================
+# 🌐 GLOBAL SETTINGS
+# =============================================
+worker_processes  1;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    # Hide Nginx version
+    server_tokens off;
+
+    # ---------------------------
+    # 🌍 RATE LIMIT ZONES (per IP)
+    # ---------------------------
+    # Public auth endpoints: 5 requests per minute
+    limit_req_zone $binary_remote_addr zone=public_auth_zone:10m rate=5r/m;
+
+    # Auth endpoints: 10 requests per minute
+    limit_req_zone $binary_remote_addr zone=auth_zone:10m rate=10r/m;
+
+    # ---------------------------
+    # 🌍 SERVER BLOCK
+    # ---------------------------
+    server {
+        listen 8081;  # Nginx port
+        server_name localhost;
+
+        # ---------------------------
+        # /api/public/auth/** → rate limit 5r/m
+        # ---------------------------
+        location /api/public/auth {
+            limit_req zone=public_auth_zone burst=2 nodelay;
+
+            proxy_pass http://127.0.0.1:8010;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # ---------------------------
+        # /api/auth/** → rate limit 10r/m
+        # ---------------------------
+        location /api/auth {
+            limit_req zone=auth_zone burst=5 nodelay;
+
+            proxy_pass http://127.0.0.1:8010;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # ---------------------------
+        # Catch-all for other endpoints (no rate limit)
+        # ---------------------------
+        location / {
+            proxy_pass http://127.0.0.1:8010;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # ---------------------------
+        # Custom 429 response (rate limit exceeded)
+        # ---------------------------
+        error_page 429 = @rate_limit_exceeded;
+
+        location @rate_limit_exceeded {
+            default_type text/plain;
+            return 429 "Too many requests. Please wait a moment and try again.\n";
+        }
+
+        # ---------------------------
+        # Optional security headers
+        # ---------------------------
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Content-Security-Policy "default-src 'self'; frame-ancestors 'self';" always;
+    }
+}
